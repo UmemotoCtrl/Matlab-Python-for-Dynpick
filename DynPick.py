@@ -5,234 +5,312 @@
 # Copyright (c) 2025 Kazuki UMEMOTO
 # see https://github.com/UmemotoCtrl/Matlab-Python-for-Wacho-Tech-Dynpick for details
 
-
 import time
-import serial
-import serial.tools.list_ports
 import struct
 import re
+import logging
 from typing import List, Optional, Sequence
 
+import serial
+import serial.tools.list_ports
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
 class DynPick:
-    # LPFとゼロ点の設定は未実装，他は実装済み
-    ver: str = '25.11.18'  # 最終更新日
-    wait_time: float = 0.050
-    timeout : float = 0.500
-    is_started: bool = False
-    force: List[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    """
+    DynPick serial interface.
+    Use with: with DynPick(port) as dpick: ...
+    """
 
-    # 校正パラメータ（クラス全体で共有）
-    sensitivity: List[float] = [65.470, 65.440, 65.080, 1638.500, 1639.250, 1640.750]
-    zero_output: List[int] = [0x2000, 0x2000, 0x2000, 0x2000, 0x2000, 0x2000]
+    PROTOCOL_PACKET_SIZE = 27
+    DEFAULT_BAUD = 921600
+    DEFAULT_WAIT = 0.050
+    DEFAULT_TIMEOUT = 0.5
 
-    def __init__(self, port):
-        self.ser = serial.Serial(
-            port,
-            baudrate = 921600,
-            # parity = serial.PARITY_NONE,
-            # bytesize = serial.EIGHTBITS,
-            # stopbits = serial.STOPBITS_ONE,
-            # timeout = None,
-            # xonxoff = 0,
-            # rtscts = 0,
-            )
-        self.stop_continuous_read()
-    def __del__(self):
-        self.close()
-    
-    def close(self):
-        if self.ser.is_open:
+    # class-level safe defaults (immutable)
+    _DEFAULT_SENSITIVITY = (65.470, 65.440, 65.080, 1638.500, 1639.250, 1640.750)
+    _DEFAULT_ZERO_OUTPUT = (0x2000, 0x2000, 0x2000, 0x2000, 0x2000, 0x2000)
+
+    ver: str = "25.11.19"
+
+    def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = DEFAULT_TIMEOUT):
+        self.port = port
+        self.baud = baud
+        self.wait_time = self.DEFAULT_WAIT
+        self.timeout = timeout
+        self.is_started = False
+        self.force: List[float] = [0.0] * 6
+
+        # instance calibration (copied from defaults)
+        self.sensitivity: List[float] = list(self._DEFAULT_SENSITIVITY)
+        self.zero_output: List[int] = list(self._DEFAULT_ZERO_OUTPUT)
+
+        # open serial with timeout to allow non-blocking checks
+        self.ser = serial.Serial(port, baudrate=baud, timeout=self.timeout)
+        # ensure sensor not continuously sending on init
+        try:
             self.stop_continuous_read()
+        except Exception:
+            # ignore errors during initialization
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if getattr(self, "ser", None) and self.ser.is_open:
+            try:
+                self.stop_continuous_read()
+            except Exception:
+                pass
             self.ser.close()
-    
-    def print_firmware_version(self):
-        time.sleep(self.wait_time)
+            logger.debug("Serial port closed.")
+
+    # --- low-level helpers ---
+    def _write(self, cmd: bytes) -> None:
         self.ser.flush()
-        self.ser.write(b'V')
+        self.ser.write(cmd)
         time.sleep(self.wait_time)
-        in_waiting = self.ser.in_waiting
-        if in_waiting > 0:
-            print(self.ser.read(in_waiting).decode())
-    def print_sensitivity(self):
-        time.sleep(self.wait_time)
-        self.ser.flush()
-        self.ser.write(b'p')
-        time.sleep(self.wait_time)
-        in_waiting = self.ser.in_waiting
-        if in_waiting > 0:
-            print(self.ser.read(in_waiting).decode())
+
+    def _read_available(self) -> bytes:
+        n = self.ser.in_waiting
+        if n:
+            return self.ser.read(n)
+        return b""
+
+    # --- public API ---
+    def print_firmware_version(self) -> None:
+        self._write(b"V")
+        data = self._read_available()
+        if data:
+            logger.info(data.decode(errors="ignore"))
+        else:
+            logger.info("No response for firmware version.")
+
+    def print_sensitivity(self) -> None:
+        self._write(b"p")
+        data = self._read_available()
+        if data:
+            logger.info(data.decode(errors="ignore"))
+        else:
+            logger.info("No response for sensitivity info.")
 
     def set_sensitivity(self) -> bool:
-        time.sleep(self.wait_time)
-        self.ser.flush()
-        self.ser.write(b'p')
-        time.sleep(self.wait_time)
-        in_waiting = self.ser.in_waiting
-        if in_waiting > 0:
-            recv = self.ser.read(in_waiting).decode()
-            try:
-                numbers = re.findall(r'\d+\.\d+', recv)
-                if len(numbers) == 6:
-                    # 0ならfloat('inf')に、ゼロ割回避
-                    DynPick.sensitivity = [
-                        float(n) if float(n) != 0.0 else float('inf') for n in numbers
-                    ]
-                    return True
-                else:
-                    print(f'Expected 6 sensitivity values, but got {len(numbers)}: {numbers}')
-                    return False
-            except Exception as e:
-                print(f'Failed to parse sensitivity data: {e}')
-                print(f'Received data: {recv}')
+        """
+        Query sensor for sensitivity values and update instance calibration.
+        Returns True on success.
+        """
+        self._write(b"p")
+        data = self._read_available()
+        if not data:
+            logger.warning("No data received from sensor for sensitivity.")
+            return False
+
+        text = data.decode(errors="ignore")
+        # robust number parsing: integers, decimals, scientific
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+        try:
+            if len(nums) >= 6:
+                vals = [float(nums[i]) for i in range(6)]
+                # replace zeros with inf to avoid division by zero as before
+                self.sensitivity = [v if v != 0.0 else float("inf") for v in vals]
+                logger.info("Sensitivities updated: %s", self.sensitivity)
+                return True
+            else:
+                logger.warning("Expected 6 sensitivity values, got %d: %s", len(nums), nums)
                 return False
-        else:
-            print('No data received from sensor.')
+        except Exception as e:
+            logger.exception("Failed to parse sensitivity data: %s", e)
             return False
 
     def read_temperature(self) -> Optional[float]:
-        time.sleep(self.wait_time)
-        self.ser.flush()
-        self.ser.write(b'T')
-        time.sleep(self.wait_time)
-        in_waiting = self.ser.in_waiting
-        if in_waiting > 0:
-            recv = self.ser.read(in_waiting)
-            data = struct.unpack('=4s2B', recv)
-            return float(int(data[0].decode(), 16)) / 16.0
-        else:
+        self._write(b"T")
+        data = self._read_available()
+        if not data:
+            return None
+        # expect at least 4+2 bytes as in original (=4s2B)
+        try:
+            if len(data) < 6:
+                logger.debug("Temperature packet too short: %d bytes", len(data))
+                return None
+            raw, b1, b2 = struct.unpack("=4s2B", data[:6])
+            temp_hex = raw.decode(errors="ignore")
+            return float(int(temp_hex, 16)) / 16.0
+        except Exception:
+            logger.exception("Failed to decode temperature from: %r", data)
             return None
 
     def read_once(self) -> List[float]:
-        self.ser.write(b'R')
-        time.sleep(self.wait_time/5)
+        """One-shot read: sends 'R' and returns 6-channel force/torque."""
+        self._write(b"R")
+        # shorter wait as original used wait_time/5
+        time.sleep(max(0.001, self.wait_time / 5.0))
         in_waiting = self.ser.in_waiting
-        if in_waiting == 27:
-            recv = self.ser.read(in_waiting)
-            data = struct.unpack('=B4s4s4s4s4s4s2B', recv)[1:7]
-            return self.bytesToDouble(list(data))
-        else:
-            print('No available data.')
-            return [float('nan')] * 6
+        if in_waiting >= self.PROTOCOL_PACKET_SIZE:
+            recv = self.ser.read(self.PROTOCOL_PACKET_SIZE)
+            try:
+                parts = struct.unpack("=B4s4s4s4s4s4s2B", recv)[1:7]
+                return self._bytes_to_double(list(parts))
+            except Exception:
+                logger.exception("Failed to unpack read_once packet.")
+                return [float("nan")] * 6
+        logger.debug("No available data for read_once (in_waiting=%d).", in_waiting)
+        return [float("nan")] * 6
 
-    def start_continuous_read(self):
+    def start_continuous_read(self) -> None:
         self.ser.flush()
-        self.ser.write(b'S')
-        time.sleep(self.wait_time)
+        self._write(b"S")
         self.is_started = True
+        # try an immediate read to prime
         self.force = self.read_continuous()
-    def stop_continuous_read(self):
-        self.ser.write(b'E')
-        time.sleep(self.wait_time)
+
+    def stop_continuous_read(self) -> None:
+        try:
+            self._write(b"E")
+        except Exception:
+            # if serial not open or write fails, ignore
+            pass
         self.ser.flush()
         self.is_started = False
+
     def read_continuous(self) -> List[float]:
-        # 13	0D	CR
-        # 10	0A	LF
-        if self.is_started:
-            in_waiting = self.ser.in_waiting
-            if in_waiting >= 27*2:
-                recv = self.ser.read(in_waiting)
-                if 0x0A in recv:
-                    ii = recv.rfind(0x0A)
-                    recv = recv[ii-27+1:ii+1]
-                    if recv[25] == 0x0D:
-                        data = struct.unpack('=B4s4s4s4s4s4s2B', recv)[1:7]
-                        self.force = self.bytesToDouble(list(data))
-                    # self.ser.flush()
-                return self.force
-            else:
-                return self.force
-        else:
-            print('Data send is NOT started.')
+        """
+        Non-blocking read of continuous stream. Returns last known force values.
+        Protocol: lines ending with LF(0x0A), CR(0x0D) expected.
+        """
+        if not self.is_started:
+            logger.debug("Data send is NOT started.")
             return self.force
 
-    def bytesToDouble(self, argBytes6: Sequence[bytes]) -> List[float]:
-        # 16進ASCII文字列 -> int
-        hex_strs = [b.decode() if isinstance(b, (bytes, bytearray)) else str(b) for b in argBytes6]
-        retInt6 = [int(s, 16) for s in hex_strs]
+        in_waiting = self.ser.in_waiting
+        if in_waiting < self.PROTOCOL_PACKET_SIZE:
+            return self.force
 
-        # ゼロ点補正および感度によるスケーリング
-        retDouble6 = [
-            float(retInt6[i] - self.zero_output[i]) / self.sensitivity[i]
-            for i in range(6)
-        ]
-        return retDouble6
+        recv = self.ser.read(in_waiting)
+        if not recv:
+            return self.force
 
-    def set_calibration(self, sensitivity: Optional[List[float]] = None, zero_output: Optional[List[int]] = None) -> None:
+        # find last LF (0x0A) and extract preceding packet
+        try:
+            if b"\n" in recv:
+                idx = recv.rfind(b"\n")
+                start = idx - self.PROTOCOL_PACKET_SIZE + 1
+                if start >= 0:
+                    packet = recv[start : idx + 1]
+                    # check CR present at expected position (as original)
+                    if len(packet) == self.PROTOCOL_PACKET_SIZE and packet[-2] == 0x0D:
+                        parts = struct.unpack("=B4s4s4s4s4s4s2B", packet)[1:7]
+                        self.force = self._bytes_to_double(list(parts))
+        except Exception:
+            logger.exception("Failed to parse continuous packet.")
+        return self.force
+
+    def _bytes_to_double(self, arg_bytes6: Sequence[bytes]) -> List[float]:
+        """
+        Convert 6 ASCII-hex fields (bytes) to scaled floats using zero_output and sensitivity.
+        """
+        hex_strs = []
+        for b in arg_bytes6:
+            if isinstance(b, (bytes, bytearray)):
+                s = b.decode(errors="ignore").strip()
+            else:
+                s = str(b).strip()
+            hex_strs.append(s)
+
+        try:
+            ints = [int(s, 16) for s in hex_strs]
+        except Exception:
+            logger.exception("Failed to convert hex strings to int: %s", hex_strs)
+            return [float("nan")] * 6
+
+        doubles = []
+        for i in range(6):
+            try:
+                val = float(ints[i] - self.zero_output[i]) / float(self.sensitivity[i])
+            except Exception:
+                val = float("nan")
+            doubles.append(val)
+        return doubles
+
+    def set_calibration(
+        self,
+        sensitivity: Optional[List[float]] = None,
+        zero_output: Optional[List[int]] = None,
+    ) -> None:
         if sensitivity is not None:
             if len(sensitivity) != 6:
-                raise ValueError('sensitivity must be a list of 6 elements.')
-            self.sensitivity = sensitivity
+                raise ValueError("sensitivity must be a list of 6 elements.")
+            self.sensitivity = list(sensitivity)
         if zero_output is not None:
             if len(zero_output) != 6:
-                raise ValueError('zero_output must be a list of 6 elements.')
-            self.zero_output = zero_output
+                raise ValueError("zero_output must be a list of 6 elements.")
+            self.zero_output = list(zero_output)
 
+    # --- utilities for port discovery ---
     @classmethod
-    def open_ports_by_serial_number(cls, serial_number):
+    def open_ports_by_serial_number(cls, serial_number: str) -> "DynPick":
         ports = serial.tools.list_ports.comports()
-        for port in ports:
-            if port.serial_number == serial_number:
-                return cls(port.device)
-        raise ValueError(serial_number + " was not found.")
+        for p in ports:
+            if p.serial_number == serial_number:
+                return cls(p.device)
+        raise ValueError(f"{serial_number} was not found.")
+
     @staticmethod
-    def device_name_from_serial_number(serial_number):
+    def device_name_from_serial_number(serial_number: str) -> Optional[str]:
         ports = serial.tools.list_ports.comports()
-        for port in ports:
-            if port.serial_number == serial_number:
-                return port.device
+        for p in ports:
+            if p.serial_number == serial_number:
+                return p.device
         return None
+
     @staticmethod
-    def print_list_ports():
+    def print_list_ports() -> None:
         ports = serial.tools.list_ports.comports()
-        for port in ports:
-            if port.vid is None:
-                port.serial_number = "None"
-                port.vid = 0
-                port.pid = 0
-            print('Name:%s, Serial Number:%s, VID:PID:%04X:%04X, Manufacturer:%s'%(
-                port.device,
-                port.serial_number,
-                port.vid,
-                port.pid,
-                port.manufacturer) )
-            # print("-----------")
-            # print(port.device)
-            # print(port.name)
-            # print(port.description)
-            # print(port.hwid)
-            # print(port.vid)
-            # print(port.pid)
-            # print(port.serial_number)
-            # print(port.location)
-            # print(port.manufacturer)
-            # print(port.product)
-            # print(port.interface)
+        for p in ports:
+            vid = p.vid or 0
+            pid = p.pid or 0
+            sn = p.serial_number or "None"
+            manu = p.manufacturer or ""
+            logger.info("Name:%s, Serial Number:%s, VID:PID:%04X:%04X, Manufacturer:%s", p.device, sn, vid, pid, manu)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    # logging.disable(logging.CRITICAL) # to disable all logging
+    # logging.disable(logging.NOTSET) # to enable logging again
+    logging.info("DynPick Python Interface Version %s", DynPick.ver)
     DynPick.print_list_ports()
-
+    ports = serial.tools.list_ports.comports()
     '''
     # Port Open from Port Name
     # ls -l /dev/tty.* # for macOS
-    dpick = DynPick('/dev/tty.usbserial-AU02EQ8G')
-    dpick = DynPick('/dev/tty.usbserial-AU05U761')    
+    dpick = DynPick('/dev/tty.usbserial-AU05U761A')
     # See device manager for Windows OS
     dpick = DynPick('COM4')
     # The argument (serial number) should be rewritten using the output from DynPick.print_list_ports() as the reference.
     # dpick = DynPick.open_ports_by_serial_number('AU05U761A')
     '''
-    # Open the last port.
-    ports = serial.tools.list_ports.comports()
-    dpick = DynPick.open_ports_by_serial_number(ports[-1].serial_number)
-    # dpick.print_firmware_version()
-    # dpick.print_sensitivity()
-    # print(dpick.read_temperature())
-    dpick.set_sensitivity()
-    print(dpick.read_once(), "[N], [Nm]")
-
-    dpick.start_continuous_read()
-    for i in range(10):
-        print(dpick.read_continuous())
-        time.sleep(0.3)
-    dpick.stop_continuous_read()
+    if not ports:
+        logger.info("No serial ports found.")
+    else:
+        dpick = DynPick.open_ports_by_serial_number(ports[-1].serial_number)
+        dpick.print_firmware_version()
+        dpick.print_sensitivity()
+        logger.info("Temperature: %.2f °C", dpick.read_temperature())
+        dpick.set_sensitivity()
+        logger.info("%s [N], [Nm]", dpick.read_once())
+        dpick.start_continuous_read()
+        for _ in range(10):
+            time.sleep(0.3)
+            logger.info(dpick.read_continuous())
+        dpick.stop_continuous_read()
