@@ -15,8 +15,7 @@ import serial
 import serial.tools.list_ports
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
+# logging.basicConfig(level=logging.INFO)
 
 class DynPick:
     """
@@ -286,6 +285,7 @@ class DynPick:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)    # To see packet error messages
     # logging.disable(logging.CRITICAL) # to disable all logging
     # logging.disable(logging.NOTSET) # to enable logging again
     logging.info("DynPick Python Interface Version %s", DynPick.ver)

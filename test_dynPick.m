@@ -4,11 +4,16 @@
 % # See device manager for windows OS
 % dpick = py.DynPick.DynPick('COM3');
 
-% py.logging.disable(py.logging.CRITICAL);
-py.logging.disable(py.logging.NOTSET);
+py.logging.basicConfig(pyargs('level', py.logging.INFO));
+% py.logging.basicConfig(pyargs('level', py.logging.DEBUG));
 
-py.DynPick.DynPick.print_list_ports();
-ports = cell(length(  cell(py.serial.tools.list_ports.comports())  ), 2);
+DynPick = py.importlib.import_module('DynPick');
+% py.importlib.reload(DynPick);
+
+DynPick.DynPick.print_list_ports();
+
+ports_cell = cell(py.serial.tools.list_ports.comports());
+ports = cell(length(  ports_cell  ), 2);
 for ii=1:length(ports_cell)
     ports{ii,1} = ports_cell{ii}.device.char;
     ports{ii,2} = ports_cell{ii}.serial_number.char;
@@ -26,5 +31,14 @@ for ii=1:10
 end
 dpick.stop_continuous_read();
 
-clear dpick;
+dpick.start_continuous_read();
+num = 1000;
+pause(0.1);
+t1 = tic;
+for ii=1:num
+    dpick.read_continuous();
+end
+py.logging.info("%s sec (%d reads)", toc(t1), num);
+dpick.stop_continuous_read();
 
+clear dpick;
