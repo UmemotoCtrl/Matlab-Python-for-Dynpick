@@ -38,7 +38,7 @@ t1 = tic;
 for ii=1:num
     dpick.read_continuous();
 end
-py.logging.info("%s sec (%d reads)", toc(t1), num);
+py.logging.info("%s msec (%d reads)", toc(t1)*1000, num);
 dpick.stop_continuous_read();
 
 clear dpick;
